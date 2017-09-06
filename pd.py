@@ -21,6 +21,7 @@
 Gray Code and rotary encoder PD.
 '''
 
+import math
 import sigrokdecode as srd
 from collections import deque
 
@@ -54,13 +55,49 @@ def gray_decode(gray):
 	return temp
 
 
-MAX_CHANNELS = 8 # 10 channels causes some weird problems...
+def prefix_fmt(value, emin=None):
+	sgn = (value > 0) - (value < 0)
+	value = abs(value)
+	p = math.log10(value) if value else 0
+	value = sgn * math.floor(value * 10**int(3-p)) * 10**-int(3-p)
+	e = p // 3 * 3
+	if emin is not None and e < emin:
+		e = emin
+	value *= 10**-e
+	p -= e
+	decimals = 2 - int(p)
+	prefixes = {-9: 'n', -6: 'µ', -3: 'm', 0: '', 3: 'k', 6: 'M', 9: 'G'}
+	return "{0:.{1}f} {2}".format(value, decimals, prefixes[e])
 
 class SamplerateError(Exception):
 	pass
 
 class ChannelMapError(Exception):
 	pass
+
+class Value:
+	def __init__(self, onchange):
+		self.onchange = onchange
+		self.timestamp = None
+		self.value = None
+
+	def get(self):
+		return self.value
+
+	def set(self, timestamp, newval):
+		if newval != self.value:
+			if self.value is not None:
+				self.onchange(self.timestamp, self.value, timestamp, newval)
+
+			self.value = newval
+			self.timestamp = timestamp
+
+		elif False:
+			if self.value is not None:
+				self.onchange(self.timestamp, self.value, timestamp, newval)
+
+
+MAX_CHANNELS = 8 # 10 channels causes some weird problems...
 
 class Decoder(srd.Decoder):
 	api_version = 3
@@ -85,20 +122,36 @@ class Decoder(srd.Decoder):
 	)
 	annotations = (
 		('phase', 'Phase'),
+		('increment', 'Increment'),
 		('count', 'Count'),
-		('time', 'Time'),
+		('turns', 'Turns'),
+		('interval', 'Interval'),
 		('average', 'Average'),
-		('rate', 'Rate'),
-		('rpm', 'rpm'),
+		('rpm', 'Rate'),
 	)
 	annotation_rows = tuple((u,v,(i,)) for i,(u,v) in enumerate(annotations))
 
 	def __init__(self):
 		self.num_channels = 0
-		self.phase = 0
-		self.count = 0
 		self.samplerate = None # baserate
 		self.last_n = deque()
+
+		self.phase = Value(self.on_phase)
+		self.increment = Value(self.on_increment)
+		self.count = Value(self.on_count)
+		self.turns = Value(self.on_turns)
+
+	def on_phase(self, told, vold, tnew, vnew):
+		self.put(told, tnew, self.out_ann, [0, ["{}".format(vold)]])
+
+	def on_increment(self, told, vold, tnew, vnew):
+		self.put(told, tnew, self.out_ann, [1, ["{:+d}".format(vold)]])
+
+	def on_count(self, told, vold, tnew, vnew):
+		self.put(told, tnew, self.out_ann, [2, ["{}".format(vold)]])
+
+	def on_turns(self, told, vold, tnew, vnew):
+		self.put(told, tnew, self.out_ann, [3, ["{:+d}".format(vold)]])
 
 	def metadata(self, key, value):
 		if key == srd.SRD_CONF_SAMPLERATE:
@@ -124,38 +177,49 @@ class Decoder(srd.Decoder):
 		startbits = self.wait()
 		curtime = self.samplenum
 		
-		self.phase = gray_decode(bitpack(startbits[:self.num_channels]))
+		self.turns.set(self.samplenum, 0)
+		self.count.set(self.samplenum, 0)
+		self.phase.set(self.samplenum, gray_decode(bitpack(startbits[:self.num_channels])))
+		avg_period = 1
 
 		while True:
 			prevtime = curtime
 			bits = self.wait([{i: 'e'} for i in range(self.num_channels)])
 			curtime = self.samplenum
 
-			oldcount = self.count
-			oldphase = self.phase
+			oldcount = self.count.get()
+			oldphase = self.phase.get()
 
-			newphase = self.phase = gray_decode(bitpack(bits[:self.num_channels]))
+			newphase = gray_decode(bitpack(bits[:self.num_channels]))
+			self.phase.set(self.samplenum, newphase)
 
 			phasedelta = (newphase - oldphase + (ENCODER_STEPS//2-1)) % ENCODER_STEPS - (ENCODER_STEPS//2-1)
+			self.increment.set(self.samplenum, phasedelta)
 
 			period = (curtime - prevtime) / self.samplerate / abs(phasedelta or 1)
 
-			self.count += phasedelta
+			self.count.set(self.samplenum, self.count.get() + phasedelta)
 
+			if self.options['pulses']:
+				self.turns.set(self.samplenum, self.count.get() // self.options['pulses'])
+
+			avg_period_prev = avg_period
 			self.last_n.append(period)
 			if len(self.last_n) > self.options['avg_period']:
 				self.last_n.popleft()
+			avg_period = sum(self.last_n) / len(self.last_n)
 
-			self.put(prevtime, curtime, self.out_ann, [0, ["{}".format(oldphase)]])
-			self.put(prevtime, curtime, self.out_ann, [1, ["{}".format(oldcount)]])
-
-			self.put(prevtime, curtime, self.out_ann, [2, ["{:.1f} us".format(1e6 * period)]])
+			self.put(prevtime, curtime, self.out_ann, [4, [
+				"{}s, {}Hz".format(
+					prefix_fmt(period),
+					prefix_fmt(1/period))]])
 
 			if self.options['avg_period']:
-				self.put(prevtime, curtime, self.out_ann, [3, ["{:.1f} us".format(1e6 * sum(self.last_n) / len(self.last_n))]])
-
-			self.put(prevtime, curtime, self.out_ann, [4, ["{:.1f} Hz".format(1 / period)]])
+				self.put(prevtime, curtime, self.out_ann, [5, [
+					"{}s, {}Hz".format(
+						prefix_fmt(avg_period),
+						prefix_fmt(1 / avg_period))]])
 
 			if self.options['pulses']:
-				self.put(prevtime, curtime, self.out_ann, [5, ["{:.1f}".format(60 / period / self.options['pulses'])]])
+				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 / period / self.options['pulses'], emin=0))]])
 
