@@ -145,7 +145,14 @@ class Decoder(srd.Decoder):
 		self.put(told, tnew, self.out_ann, [0, ["{}".format(vold)]])
 
 	def on_increment(self, told, vold, tnew, vnew):
-		self.put(told, tnew, self.out_ann, [1, ["{:+d}".format(vold)]])
+		if vold == 0:
+			message = "0"
+		elif abs(vold) == self.ENCODER_STEPS//2:
+			message = "±π"
+		else:
+			message = "{:+d}".format(vold)
+
+		self.put(told, tnew, self.out_ann, [1, [message]])
 
 	def on_count(self, told, vold, tnew, vnew):
 		self.put(told, tnew, self.out_ann, [2, ["{}".format(vold)]])
@@ -172,7 +179,7 @@ class Decoder(srd.Decoder):
 			if chmask != [i < self.num_channels for i in range(MAX_CHANNELS)]:
 				raise ChannelMapError("Assigned channels need to be contiguous")
 
-		ENCODER_STEPS = 1 << self.num_channels
+		self.ENCODER_STEPS = 1 << self.num_channels
 
 		startbits = self.wait()
 		curtime = self.samplenum
@@ -180,7 +187,6 @@ class Decoder(srd.Decoder):
 		self.turns.set(self.samplenum, 0)
 		self.count.set(self.samplenum, 0)
 		self.phase.set(self.samplenum, gray_decode(bitpack(startbits[:self.num_channels])))
-		avg_period = 1
 
 		while True:
 			prevtime = curtime
@@ -193,33 +199,34 @@ class Decoder(srd.Decoder):
 			newphase = gray_decode(bitpack(bits[:self.num_channels]))
 			self.phase.set(self.samplenum, newphase)
 
-			phasedelta = (newphase - oldphase + (ENCODER_STEPS//2-1)) % ENCODER_STEPS - (ENCODER_STEPS//2-1)
+			phasedelta = (newphase - oldphase + (self.ENCODER_STEPS//2-1)) % self.ENCODER_STEPS - (self.ENCODER_STEPS//2-1)
 			self.increment.set(self.samplenum, phasedelta)
+			if abs(phasedelta) == self.ENCODER_STEPS//2: phasedelta = 0
 
-			period = (curtime - prevtime) / self.samplerate / abs(phasedelta or 1)
+			period = (curtime - prevtime) / self.samplerate
+			freq = abs(phasedelta or 0) / period
 
 			self.count.set(self.samplenum, self.count.get() + phasedelta)
 
 			if self.options['pulses']:
 				self.turns.set(self.samplenum, self.count.get() // self.options['pulses'])
 
-			avg_period_prev = avg_period
-			self.last_n.append(period)
-			if len(self.last_n) > self.options['avg_period']:
-				self.last_n.popleft()
-			avg_period = sum(self.last_n) / len(self.last_n)
-
 			self.put(prevtime, curtime, self.out_ann, [4, [
 				"{}s, {}Hz".format(
 					prefix_fmt(period),
-					prefix_fmt(1/period))]])
+					prefix_fmt(freq))]])
 
 			if self.options['avg_period']:
+				self.last_n.append((abs(phasedelta), period))
+				if len(self.last_n) > self.options['avg_period']:
+					self.last_n.popleft()
+
+				avg_period = sum(v for u,v in self.last_n) / sum(u for u,v in self.last_n)
 				self.put(prevtime, curtime, self.out_ann, [5, [
 					"{}s, {}Hz".format(
 						prefix_fmt(avg_period),
 						prefix_fmt(1 / avg_period))]])
 
 			if self.options['pulses']:
-				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 / period / self.options['pulses'], emin=0))]])
+				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 * freq / self.options['pulses'], emin=0))]])
 
