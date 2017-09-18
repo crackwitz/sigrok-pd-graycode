@@ -117,7 +117,7 @@ class Decoder(srd.Decoder):
 		{ 'id': 'numchannels', 'desc': 'Number of Channels', 'default': 0 },
 		# FIXME: this can be removed once pulseview's has_channel() is fixed
 
-		{ 'id': 'pulses', 'desc': 'Edges per Rotation', 'default': 0 },
+		{ 'id': 'edges', 'desc': 'Edges per Rotation', 'default': 0 },
 		{ 'id': 'avg_period', 'desc': 'Averaging period', 'default': 10 },
 	)
 	annotations = (
@@ -208,8 +208,8 @@ class Decoder(srd.Decoder):
 
 			self.count.set(self.samplenum, self.count.get() + phasedelta)
 
-			if self.options['pulses']:
-				self.turns.set(self.samplenum, self.count.get() // self.options['pulses'])
+			if self.options['edges']:
+				self.turns.set(self.samplenum, self.count.get() // self.options['edges'])
 
 			self.put(prevtime, curtime, self.out_ann, [4, [
 				"{}s, {}Hz".format(
@@ -227,6 +227,6 @@ class Decoder(srd.Decoder):
 						prefix_fmt(avg_period),
 						prefix_fmt(1 / avg_period))]])
 
-			if self.options['pulses']:
-				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 * freq / self.options['pulses'], emin=0))]])
+			if self.options['edges']:
+				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 * freq / self.options['edges'], emin=0))]])
 
