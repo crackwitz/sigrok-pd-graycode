@@ -69,9 +69,6 @@ def prefix_fmt(value, emin=None):
 	prefixes = {-9: 'n', -6: 'µ', -3: 'm', 0: '', 3: 'k', 6: 'M', 9: 'G'}
 	return "{0:.{1}f} {2}".format(value, decimals, prefixes[e])
 
-class SamplerateError(Exception):
-	pass
-
 class ChannelMapError(Exception):
 	pass
 
@@ -114,9 +111,6 @@ class Decoder(srd.Decoder):
 		for i in range(MAX_CHANNELS)
 	)
 	options = (
-		{ 'id': 'numchannels', 'desc': 'Number of Channels', 'default': 0 },
-		# FIXME: this can be removed once pulseview's has_channel() is fixed
-
 		{ 'id': 'edges', 'desc': 'Edges per Rotation', 'default': 0 },
 		{ 'id': 'avg_period', 'desc': 'Averaging period', 'default': 10 },
 	)
@@ -133,7 +127,7 @@ class Decoder(srd.Decoder):
 
 	def __init__(self):
 		self.num_channels = 0
-		self.samplerate = None # baserate
+		self.samplerate = None # None -> no timing output
 		self.last_n = deque()
 
 		self.phase = Value(self.on_phase)
@@ -168,16 +162,10 @@ class Decoder(srd.Decoder):
 		self.out_ann = self.register(srd.OUTPUT_ANN)
 
 	def decode(self):
-		if not self.samplerate:
-			raise SamplerateError('Cannot decode without samplerate.')
-
-		if self.options['numchannels']:
-			self.num_channels = self.options['numchannels']
-		else:
-			chmask = [self.has_channel(i) for i in range(MAX_CHANNELS)]
-			self.num_channels = sum(chmask)
-			if chmask != [i < self.num_channels for i in range(MAX_CHANNELS)]:
-				raise ChannelMapError("Assigned channels need to be contiguous")
+		chmask = [self.has_channel(i) for i in range(MAX_CHANNELS)]
+		self.num_channels = sum(chmask)
+		if chmask != [i < self.num_channels for i in range(MAX_CHANNELS)]:
+			raise ChannelMapError("Assigned channels need to be contiguous")
 
 		self.ENCODER_STEPS = 1 << self.num_channels
 
@@ -199,34 +187,36 @@ class Decoder(srd.Decoder):
 			newphase = gray_decode(bitpack(bits[:self.num_channels]))
 			self.phase.set(self.samplenum, newphase)
 
-			phasedelta = (newphase - oldphase + (self.ENCODER_STEPS//2-1)) % self.ENCODER_STEPS - (self.ENCODER_STEPS//2-1)
+			phasedelta_raw = (newphase - oldphase + (self.ENCODER_STEPS//2-1)) % self.ENCODER_STEPS - (self.ENCODER_STEPS//2-1)
+			phasedelta = phasedelta_raw
 			self.increment.set(self.samplenum, phasedelta)
 			if abs(phasedelta) == self.ENCODER_STEPS//2: phasedelta = 0
-
-			period = (curtime - prevtime) / self.samplerate
-			freq = abs(phasedelta or 0) / period
 
 			self.count.set(self.samplenum, self.count.get() + phasedelta)
 
 			if self.options['edges']:
 				self.turns.set(self.samplenum, self.count.get() // self.options['edges'])
 
-			self.put(prevtime, curtime, self.out_ann, [4, [
-				"{}s, {}Hz".format(
-					prefix_fmt(period),
-					prefix_fmt(freq))]])
+			if self.samplerate is not None:
+				period = (curtime - prevtime) / self.samplerate
+				freq = abs(phasedelta_raw) / period
 
-			if self.options['avg_period']:
-				self.last_n.append((abs(phasedelta), period))
-				if len(self.last_n) > self.options['avg_period']:
-					self.last_n.popleft()
-
-				avg_period = sum(v for u,v in self.last_n) / sum(u for u,v in self.last_n)
-				self.put(prevtime, curtime, self.out_ann, [5, [
+				self.put(prevtime, curtime, self.out_ann, [4, [
 					"{}s, {}Hz".format(
-						prefix_fmt(avg_period),
-						prefix_fmt(1 / avg_period))]])
+						prefix_fmt(period),
+						prefix_fmt(freq))]])
 
-			if self.options['edges']:
-				self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 * freq / self.options['edges'], emin=0))]])
+				if self.options['avg_period']:
+					self.last_n.append((abs(phasedelta_raw), period))
+					if len(self.last_n) > self.options['avg_period']:
+						self.last_n.popleft()
+
+					avg_period = sum(v for u,v in self.last_n) / (sum(u for u,v in self.last_n) or 1)
+					self.put(prevtime, curtime, self.out_ann, [5, [
+						"{}s, {}Hz".format(
+							prefix_fmt(avg_period),
+							prefix_fmt(1 / avg_period))]])
+
+				if self.options['edges']:
+					self.put(prevtime, curtime, self.out_ann, [6, ["{}rpm".format(prefix_fmt(60 * freq / self.options['edges'], emin=0))]])
 
